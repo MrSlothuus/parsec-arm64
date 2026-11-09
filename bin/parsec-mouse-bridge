@@ -1,0 +1,125 @@
+#!/usr/bin/python
+"""Give Parsec mouse movement it can use while it holds a pointer lock.
+
+The Try Omarchy VM's only pointer is an absolute tablet. While a window holds a pointer
+lock, Hyprland ignores absolute motion and never turns it into relative motion, so
+Parsec's relative mouse mode receives no movement and the Omarchy cursor freezes.
+
+This grabs the tablet and forwards its events through a virtual copy, sending each
+movement first as relative motion on a virtual mouse. Unlocked, the absolute event that
+follows lands the cursor where the relative motion already put it; locked, the relative
+motion is what reaches Parsec. Hyprland must not accelerate the virtual mouse (see
+~/.config/hypr/input.lua, README.md).
+
+Runs until the process given by --parent exits. If it dies, the kernel releases the
+grab and the tablet works directly again.
+"""
+import argparse
+import json
+import os
+import select
+import subprocess
+import sys
+import threading
+import time
+
+import evdev
+from evdev import ecodes
+
+
+TABLET_NAME = "QEMU Virtio Tablet"
+# A jump this large (in logical pixels) in one report is the Mac pointer re-entering
+# the VM window somewhere else, not movement to pass on.
+MAX_STEP = 500
+
+# Width and height of the area Hyprland maps the tablet onto: the bounding box of all
+# monitors in logical pixels. Refreshed in the background since the VM window can resize.
+area = [0.0, 0.0]
+
+
+def monitor_area():
+    monitors = json.loads(subprocess.run(["hyprctl", "-j", "monitors"], capture_output=True, check=True).stdout)
+    boxes = []
+    for monitor in monitors:
+        width, height = monitor["width"] / monitor["scale"], monitor["height"] / monitor["scale"]
+        if monitor["transform"] % 2:
+            width, height = height, width
+        boxes.append((monitor["x"], monitor["y"], monitor["x"] + width, monitor["y"] + height))
+    return [max(b[2] for b in boxes) - min(b[0] for b in boxes), max(b[3] for b in boxes) - min(b[1] for b in boxes)]
+
+
+def refresh_area():
+    while True:
+        time.sleep(2)
+        try:
+            area[:] = monitor_area()
+        except (OSError, ValueError, KeyError, subprocess.CalledProcessError):
+            pass  # Keep the last known size.
+
+
+def find_tablet():
+    for path in evdev.list_devices():
+        device = evdev.InputDevice(path)
+        if device.name == TABLET_NAME:
+            return device
+        device.close()
+    sys.exit(f"parsec-mouse-bridge: {TABLET_NAME} not found or not readable")
+
+
+parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+parser.add_argument("--parent", type=int, required=True, help="exit when this process exits")
+parent = os.pidfd_open(parser.parse_args().parent)
+
+area[:] = monitor_area()
+threading.Thread(target=refresh_area, daemon=True).start()
+
+tablet = find_tablet()
+ranges = [tablet.absinfo(axis) for axis in (ecodes.ABS_X, ecodes.ABS_Y)]
+copy = evdev.UInput.from_device(tablet, name="Parsec bridge tablet")
+mouse = evdev.UInput(
+    {ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE], ecodes.EV_REL: [ecodes.REL_X, ecodes.REL_Y]},
+    name="Parsec bridge mouse",
+)
+tablet.grab()
+print(f"parsec-mouse-bridge: bridging {tablet.path}", flush=True)
+
+position = [None, None]
+remainder = [0.0, 0.0]
+report = []
+while parent not in select.select([tablet.fd, parent], [], [])[0]:
+    for event in tablet.read():
+        if event.type != ecodes.EV_SYN:
+            report.append(event)
+            continue
+        if event.code == ecodes.SYN_DROPPED:
+            report.clear()
+            position = [None, None]
+            continue
+
+        moved = [0.0, 0.0]
+        for item in report:
+            if item.type == ecodes.EV_ABS and item.code in (ecodes.ABS_X, ecodes.ABS_Y):
+                axis = item.code - ecodes.ABS_X
+                if position[axis] is not None:
+                    span = ranges[axis].max - ranges[axis].min + 1
+                    moved[axis] = (item.value - position[axis]) * area[axis] / span
+                position[axis] = item.value
+
+        if max(abs(moved[0]), abs(moved[1])) > MAX_STEP:
+            remainder = [0.0, 0.0]
+        else:
+            steps = []
+            for axis in (0, 1):
+                remainder[axis] += moved[axis]
+                steps.append(int(remainder[axis]))
+                remainder[axis] -= steps[axis]
+            if any(steps):
+                for code, step in zip((ecodes.REL_X, ecodes.REL_Y), steps):
+                    if step:
+                        mouse.write(ecodes.EV_REL, code, step)
+                mouse.syn()
+
+        for item in report:
+            copy.write_event(item)
+        copy.syn()
+        report.clear()

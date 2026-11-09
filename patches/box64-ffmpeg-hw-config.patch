@@ -1,0 +1,13 @@
+diff --git i/src/wrapped/wrappedlibavcodec58_private.h w/src/wrapped/wrappedlibavcodec58_private.h
+index b88f4ef63..31e7f0518 100644
+--- i/src/wrapped/wrappedlibavcodec58_private.h
++++ w/src/wrapped/wrappedlibavcodec58_private.h
+@@ -53,7 +53,7 @@ GO(avcodec_find_encoder_by_name, pFp)
+ GO(avcodec_flush_buffers, vFp)
+ GO(avcodec_free_context, vFp)
+ //GOM(avcodec_get_class, pFEv)
+-//GOM(avcodec_get_hw_config, pFEpi)
++GO(avcodec_get_hw_config, pFpi)
+ //GOM(avcodec_get_hw_frames_parameters, iFEppip)
+ GO(avcodec_get_name, pFu)
+ //GOM(avcodec_get_subtitle_rect_class, pFEv)

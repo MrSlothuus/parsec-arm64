@@ -1,0 +1,133 @@
+#!/usr/bin/python
+"""Launch the x86-64 Parsec client under Box64 on ARM64 Linux (see install.sh)."""
+import gzip
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import resource
+import shutil
+import subprocess
+import sys
+from urllib.parse import unquote
+import urllib.request
+
+
+home = Path.home()
+here = Path(__file__).resolve().parent
+runtime = here.parent / "opt/parsec-native"
+data = home / ".parsec"
+state = home / ".local/state/parsec-native"
+builds = "https://builds.parsec.app/channel/release1"
+
+
+def fail(message):
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "--app-name=Parsec", "Parsec could not start", message], check=False)
+    sys.exit(message)
+
+
+def fetch(url):
+    with urllib.request.urlopen(url, timeout=30) as response:
+        return response.read()
+
+
+def is_valid(metadata):
+    return (
+        isinstance(metadata, dict)
+        and re.fullmatch(r"parsecd-[A-Za-z0-9.-]+\.so", str(metadata.get("so_name", ""))) is not None
+        and re.fullmatch(r"[0-9a-f]{64}", str(metadata.get("hash", ""))) is not None
+    )
+
+
+def is_intact(library, expected_hash):
+    return library.is_file() and hashlib.sha256(library.read_bytes()).hexdigest() == expected_hash
+
+
+def install(metadata):
+    """Download a Parsec library and accept it only if it matches the published hash."""
+    payload = fetch(f"{builds}/binary/linux/gz/{metadata['so_name']}")
+    if payload[:2] == b"\x1f\x8b":
+        payload = gzip.decompress(payload)
+    if hashlib.sha256(payload).hexdigest() != metadata["hash"]:
+        fail(f"Downloaded {metadata['so_name']} does not match Parsec's published hash")
+    partial = data / (metadata["so_name"] + ".partial")
+    partial.unlink(missing_ok=True)
+    partial.write_bytes(payload)
+    partial.chmod(0o444)
+    partial.replace(data / metadata["so_name"])
+
+
+arguments = []
+if len(sys.argv) > 2:
+    sys.exit("Usage: parsec-native [parsec://peer_id=COMPUTER_ID]")
+if len(sys.argv) == 2:
+    match = re.fullmatch(r"parsec:///?(?:\?)?peer_id=([A-Za-z0-9_-]+)/?", unquote(sys.argv[1]))
+    if not match:
+        fail("Unsupported Parsec link; expected parsec://peer_id=COMPUTER_ID")
+    arguments = [f"peer_id={match.group(1)}:client_windowed=1"]
+
+data.mkdir(mode=0o700, exist_ok=True)
+state.mkdir(mode=0o700, parents=True, exist_ok=True)
+for source in (runtime / "skel").iterdir():
+    destination = data / source.name
+    if source.is_file() and not destination.exists():
+        shutil.copy2(source, destination)
+
+# Parsec's own updater cannot replace its library under Box64: it leaves an empty
+# file behind and crashes. Apply updates here instead, before Parsec starts, and
+# repair a library the in-app updater broke during an earlier session.
+appdata = data / "appdata.json"
+installed = json.loads(appdata.read_text())
+if not is_valid(installed):
+    fail("Parsec's appdata.json contains an unexpected library name or hash")
+try:
+    latest = json.loads(fetch(f"{builds}/appdata/linux/latest"))
+except (OSError, ValueError):
+    latest = None  # Offline: start the installed version.
+metadata = latest if is_valid(latest) else installed
+
+# Box64 also crashes if the updater truncates the library it has already mapped,
+# so the current library stays read-only.
+library = data / metadata["so_name"]
+if not is_intact(library, metadata["hash"]):
+    try:
+        install(metadata)
+    except OSError as error:
+        fail(f"Could not download {metadata['so_name']}: {error}")
+library.chmod(0o444)
+if metadata != installed:
+    appdata.write_text(json.dumps(metadata, indent=4))
+    if metadata["so_name"] != installed["so_name"]:
+        (data / installed["so_name"]).unlink(missing_ok=True)
+
+environment = os.environ.copy()
+for key, directory in [("LD_LIBRARY_PATH", "lib/arm64"), ("BOX64_LD_LIBRARY_PATH", "lib/x86_64")]:
+    previous = environment.get(key)
+    environment[key] = str(runtime / directory) + (":" + previous if previous else "")
+environment.update(BOX64_LOG="0", BOX64_DLSYM_ERROR="0", BOX64_EMULATED_LIBS="libpng16.so.16:libjpeg.so.8")
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+os.umask(0o077)
+log_path = state / "launcher.log"
+if log_path.exists() and log_path.stat().st_size > 2 * 1024 * 1024:
+    log_path.replace(state / "launcher.previous.log")
+with log_path.open("a") as log:
+    os.dup2(log.fileno(), 1)
+    os.dup2(log.fileno(), 2)
+
+# The VM's absolute tablet gives Parsec no movement in relative mouse mode; the bridge
+# supplies it for as long as this process (Parsec, after the exec below) runs. Fork twice
+# so the bridge is not left as a zombie child of Parsec if it exits early.
+bridge = here / "parsec-mouse-bridge"
+if bridge.is_file():
+    launcher = os.getpid()
+    child = os.fork()
+    if child == 0:
+        os.setsid()
+        if os.fork() == 0:
+            os.execv(bridge, [str(bridge), "--parent", str(launcher)])
+        os._exit(0)
+    os.waitpid(child, 0)
+
+os.execve(runtime / "bin/box64", [str(runtime / "bin/box64"), str(runtime / "bin/parsecd"), *arguments], environment)

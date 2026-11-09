@@ -1,0 +1,4 @@
+# Lets the logged-in user run parsec-mouse-bridge: read the VM's absolute tablet
+# and create the virtual devices that stand in for it while Parsec runs.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="QEMU Virtio Tablet", TAG+="uaccess"
+SUBSYSTEM=="misc", KERNEL=="uinput", TAG+="uaccess", OPTIONS+="static_node=uinput"
